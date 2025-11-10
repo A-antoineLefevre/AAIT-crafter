@@ -58,7 +58,7 @@ class QNetwork(nn.Module):
 
         self.conv1 = nn.Conv2d(in_channels, 32, kernel_size=8, stride=4)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
-        # CORRECTION: Utilisation de Conv2d, non Conv3d
+        # CORRECTION: Utilisation de Conv2d
         self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
 
         self.fc1 = nn.Linear(3136, 512)
@@ -76,21 +76,27 @@ class QNetwork(nn.Module):
     
 # NOUVEAU: Implémentation de l'Agent DQN
 class DQNAgent:
-    # CORRECTION: Ajout des arguments de fréquence à __init__
+    # CORRECTION: Ajout des arguments de fréquence et d'exploration
     def __init__(self, action_num, device, history_length, 
                  gamma=0.99, lr=1e-4,
                  target_update_frequency=10000, 
                  learning_start_steps=50000, 
                  learning_frequency=4,
-                 epsilon_start=1.0, epsilon_final=0.1, epsilon_decay_steps=250000):
+                 epsilon_start=1.0, 
+                 epsilon_final=0.01,
+                 epsilon_decay_steps=250000):
+
         self.action_num = action_num
         self.device = device
         self.gamma = gamma
+        
+        # Hyperparamètres d'exploration
         self.epsilon_start = epsilon_start
         self.epsilon_final = epsilon_final
         self.epsilon_decay_steps = epsilon_decay_steps
-        self.epsilon = epsilon_start # Taux d'exploration initial
-        # Stockage des fréquences pour usage dans main
+        self.epsilon = epsilon_start # Taux d'exploration actuel
+
+        # Hyperparamètres de fréquence
         self.target_update_frequency = target_update_frequency
         self.learning_start_steps = learning_start_steps
         self.learning_frequency = learning_frequency
@@ -103,11 +109,16 @@ class DQNAgent:
         self.optimizer = torch.optim.Adam(self.q_net.parameters(), lr=lr)
         self.loss_fn = nn.MSELoss()
 
-        self.replay_buffer = ReplayBuffer(capacity=100000)
+        self.replay_buffer = ReplayBuffer(capacity=20000)
 
+    # CORRECTION: Ajout de step_cnt pour la décroissance d'epsilon
     def act(self, observation, step_cnt):
-        # Logique de décroissance de epsilon (à implémenter si besoin, non inclus pour la structure de base)
-        self.epsilon = max(self.epsilon_final, self.epsilon_start - (self.epsilon_start - self.epsilon_final) * min(1.0, step_cnt / self.epsilon_decay_steps)) # Exemple de décroissance linéaire
+        # Décroissance linéaire de epsilon
+        self.epsilon = max(
+            self.epsilon_final, 
+            self.epsilon_start - (self.epsilon_start - self.epsilon_final) * min(1.0, step_cnt / self.epsilon_decay_steps)
+        )
+        
         if random.random() < self.epsilon:
             # Exploration
             return random.randrange(self.action_num)
@@ -128,18 +139,17 @@ class DQNAgent:
         states, actions, rewards, next_states, dones = self.replay_buffer.sample(batch_size, self.device)
 
         # 2. Calculer les Q-valeurs actuelles Q(s, a)
-        # Utiliser gather pour prendre la Q-valeur correspondant à l'action a prise
         q_current = self.q_net(states).gather(1, actions.long())
 
-        # 3. Calculer les Q-cibles Q_target
+        # 3. Calculer les Q-cibles Q_target (DOUBLE DQN)
         with torch.no_grad():
-            # a) Calculer Q_target(s', a') en utilisant le réseau cible (target_net)
-            # b) Prendre le max de ces Q-valeurs pour obtenir l'estimation du prochain état
-            q_next_max = self.target_net(next_states).max(1)[0].unsqueeze(1)
+            # SÉLECTION (Selection) : Utiliser le réseau Q actuel (q_net) pour trouver la MEILLEURE action (a*) dans le prochain état s'.
+            a_prime = self.q_net(next_states).argmax(1).unsqueeze(1)
             
-            # c) Calculer la cible finale de Bellman
-            # Si 'done' (terminé), la cible est seulement la récompense (rewards)
-            # Sinon, cible = récompense + gamma * Q_next_max
+            # ÉVALUATION (Evaluation) : Utiliser le réseau CIBLE (target_net) pour évaluer Q(s', a*).
+            q_next_max = self.target_net(next_states).gather(1, a_prime)
+            
+            # Calculer la cible finale de Bellman
             q_target = rewards + self.gamma * q_next_max * (1 - dones.float())
 
         # 4. Calculer la perte et optimiser
@@ -167,13 +177,17 @@ def eval(agent, env, crt_step, opt):
     might use during training.
     """
     episodic_returns = []
+    # NOTE: Pour l'évaluation, le taux d'exploration doit être proche de 0 (exploitation pure).
+    # Puisque l'agent.act() utilise self.epsilon (qui est en décroissance), c'est acceptable, 
+    # mais il faudrait idéalement forcer agent.epsilon = 0.0 pour l'évaluation.
+
     for _ in range(opt.eval_episodes):
-        # NOTE: Pour l'évaluation, vous devriez idéalement forcer epsilon=0
-        # ou utiliser une fonction act_greedy() si votre agent la possède.
         obs, done = env.reset(), False
         episodic_returns.append(0)
         while not done:
-            action = agent.act(obs, crt_step)  
+            # Passe step_cnt=opt.steps à act pour utiliser epsilon_final (exploitation)
+            # ou vous pourriez définir une fonction act_eval dans l'agent.
+            action = agent.act(obs, opt.steps) 
             obs, reward, done, info = env.step(action)
             episodic_returns[-1] += reward
 
@@ -204,7 +218,7 @@ def main(opt):
     env = Env("train", opt)
     eval_env = Env("eval", opt)
     
-    # CORRECTION: Utilisation de DQNAgent avec tous les arguments nécessaires
+    # PASSAGE DES ARGUMENTS À DQNAgent
     agent = DQNAgent(
         env.action_space.n, 
         opt.device, 
@@ -218,7 +232,6 @@ def main(opt):
     )
     
     # main loop
-    # CORRECTION: Suppression des blocs d'apprentissage et de mise à jour avant la boucle (causes de l'UnboundLocalError)
     ep_cnt, step_cnt, done = 0, 0, True
     
     while step_cnt < opt.steps or not done:
@@ -232,19 +245,21 @@ def main(opt):
             obs, done = env.reset(), False
             prev_obs = obs # Définit prev_obs pour la première étape de l'épisode
 
+        # PASSAGE DE step_cnt À act POUR LA DÉCROISSANCE D'EPSILON
         action = agent.act(obs, step_cnt)
+        
         obs, reward, done, info = env.step(action)
         
-        # NOUVEAU: Stockage de la transition (s, a, r, s', done)
+        # Stockage de la transition (s, a, r, s', done)
         agent.store_transition(prev_obs, action, reward, obs, done)
 
         step_cnt += 1
-        
-        # NOUVEAU: Logique d'apprentissage DQN
+
+        # Logique d'apprentissage DQN
         if step_cnt > opt.learning_start_steps and step_cnt % opt.learning_frequency == 0:
             agent.learn(batch_size=32)
 
-        # NOUVEAU: Logique de mise à jour du réseau cible
+        # Logique de mise à jour du réseau cible
         if step_cnt % opt.target_update_frequency == 0:
             agent.target_net.load_state_dict(agent.q_net.state_dict())
 
@@ -290,7 +305,7 @@ def get_options():
         metavar="N",
         help="Number of evaluation episodes to average over",
     )
-    # NOUVEAU: Arguments d'apprentissage DQN
+    # ARGUMENTS D'APPRENTISSAGE DQN
     parser.add_argument(
         "--learning-start-steps",
         type=int,
@@ -300,7 +315,7 @@ def get_options():
     parser.add_argument(
         "--learning-frequency",
         type=int,
-        default=16, 
+        default=4, 
         help="Number of steps between learning updates.",
     )
     parser.add_argument(
@@ -309,6 +324,7 @@ def get_options():
         default=10000, 
         help="Number of steps between target network updates.",
     )
+    # ARGUMENTS D'EXPLORATION EPSILON
     parser.add_argument(
         "--epsilon-start",
         type=float,
